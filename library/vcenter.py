@@ -7,6 +7,17 @@ import atexit
 import random
 import datetime
 import time
+import requests
+requests.packages.urllib3.disable_warnings()
+import ssl
+
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
+
 
 DOCUMENTATION = '''
 ---
@@ -156,17 +167,11 @@ EXAMPLES = '''
     disk2:
       size_gb: 40
       type: thick
-  datastores:
-    - STORAGE_1
-    - STORAGE_2
-    - STORAGE_3
+  datastore: STORAGE_1
   domain_name: example.com
   num_cpus: 1
   memory_mb: 2048
   action: clone
-  resource_pools:
-    - Resource_Pool1
-    - Resource_Pool2
   os_family: linux
   vm_folder: 'FolderName'
 
@@ -195,21 +200,19 @@ def main():
                                  'revert_snapshot', 'delete_snapshot',
                                  'shutdown', 'clone', 'delete', 'upgrade_tools',
                                  'reconfigure', 'gather_facts',
-                                 'change_uuid', 'enable_drs']),
+                                 'change_uuid', 'relocate_vm']),
             template=dict(required=False, default=False, type='str'),
             propagate=dict(
                 required=False,
                 default=False,
-                choices=[True, False]),
-            group=dict(required=False, default=False, choices=[True, False]),
+                type='bool'),
+            group=dict(required=False, default=False, type='bool'),
             vm_folder=dict(required=False, default=None, type='str'),
-            disable_drs=dict(requiered=False, default=None, type='bool'),
             domain=dict(required=False, default=None, type='str'),
             datacenter_name=dict(required=False, default=None, type='str'),
             cluster_name=dict(required=False, default=None, type='str'),
-            datastores=dict(required=False, default=None, type='list'),
+            datastore=dict(required=False, default=None, type='str'),
             domain_name=dict(required=False, default=None, type='str'),
-            resource_pools=dict(required=False, default=None, type='list'),
             num_cpus=dict(required=False, default=None, type='str'),
             memory_mb=dict(required=False, default=None, type='str'),
             vm_disk=dict(required=False, default={}, type='dict'),
@@ -242,7 +245,6 @@ def main():
     os_family = module.params['os_family']
     vnics = module.params['vnics']
     resource_pool = module.params['resource_pool']
-    resource_pools = module.params['resource_pools']
     template = module.params['template']
     vm_folder = module.params['vm_folder']
     vm_name = module.params['vm_name']
@@ -259,23 +261,21 @@ def main():
     org_name = module.params['org_name']
     datacenter_name = module.params['datacenter_name']
     cluster_name = module.params['cluster_name']
-    datastores = module.params['datastores']
+    datastore = module.params['datastore']
     domain_name = module.params['domain_name']
     num_cpus = module.params['num_cpus']
     memory_mb = module.params['memory_mb']
     login_password = module.params['login_password']
     vm_uuid = module.params['vm_uuid']
-    disable_drs = module.params['disable_drs']
 
-    # set up connection
-    try:
-        si = SmartConnect(
-            host=vcenter_hostname,
-            user=username,
-            pwd=password,
-            port=int(443))
-    except:
-        module.fail_json(msg='failed to connect to vCenter server')
+    #context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+    #context.verify_mode = ssl.CERT_NONE
+    # sslContext=context
+    si = SmartConnect(
+        host=vcenter_hostname,
+        user=username,
+        pwd=password,
+        port=int(443))
 
     content = si.RetrieveContent()
 
@@ -291,9 +291,6 @@ def main():
     elif action == 'snapshot':
         vm = find_vm(module, vm_name, vm_uuid, si)
         snapshot_vm(module, vm, vm_name, si, ss_name, ss_memory)
-    elif action == 'enable_drs':
-        vm = find_vm(module, vm_name, vm_uuid, si)
-        enable_vm_drs(module, vm, cluster_name, content)
     elif action == 'revert_snapshot':
         vm = find_vm(module, vm_name, vm_uuid, si)
         revert_snapshot(module, vm, vm_name, ss_name)
@@ -303,17 +300,19 @@ def main():
     elif action == 'shutdown':
         vm = find_vm(module, vm_name, vm_uuid, si)
         shutdown_vm(module, vm, vm_name)
+    elif action == 'relocate_vm':
+        vm = find_vm(module, vm_name, vm_uuid, si)
+        relocate_vm(module, si, vm, resource_pool, cluster_name, vm_folder)
     elif action == 'clone':
         template = get_obj(content, [vim.VirtualMachine], template)
         clone_vm(
             module, si, vm_name,
             template, dns_list, suffix_list,
             datacenter_name, cluster_name,
-            datastores, domain_name,
+            datastore, domain_name,
             num_cpus, memory_mb, vm_disk,
-            vm_folder, vnics, resource_pool,
-            vm_uuid, resource_pools, os_family,
-            login_password, full_name, org_name, disable_drs)
+            vm_folder, vnics, vm_uuid, os_family,
+            login_password, full_name, org_name, resource_pool=resource_pool)
     elif action == 'delete':
         vm = find_vm(module, vm_name, vm_uuid, si)
         delete_vm(module, vm, vm_name)
@@ -438,7 +437,7 @@ def shutdown_and_wait(module, vm):
     while vm.guest.toolsRunningStatus != 'guestToolsRunning':
         wait_timer += 1
         time.sleep(2)
-        if wait_timer > 20:
+        if wait_timer > 90:
             module.fail_json(msg='gave up waiting for tools to start')
 
     # here we shutdown the VM
@@ -584,8 +583,7 @@ def reconfigure_vm_disk(module, vm, vm_disk):
     spec = vim.vm.ConfigSpec()
 
     # ensure the keys are int for sorting
-    # vm_disk = {int(k): v for k, v in vm_disk.items()}
-    vm_disk = dict((int(k), v) for k, v in vm_disk.items())
+    vm_disk = {int(k): v for k, v in vm_disk.items()}
 
     # unit_number, or scsi num
     unit_number = 0
@@ -658,13 +656,14 @@ def reconfigure_vm_disk(module, vm, vm_disk):
     return changes
 
 
-def get_obj(content, vimtype, name):
+def get_obj(content, vimtype, name, **kwargs):
     """
     Returns an object based on it's vimtype and name
     """
     obj = None
+    obj_container = kwargs.get('container', content.rootFolder)
     container = content.viewManager.CreateContainerView(
-        content.rootFolder, vimtype, True)
+        obj_container, vimtype, True)
     for c in container.view:
         if c.name == name:
             obj = c
@@ -723,12 +722,15 @@ def gather_facts(vm):
     total_capacity_in_gb = 0
     for disk in vm_disk_layout:
         for item in disk:
-            print disk[item]['size_gb']
             total_capacity_in_gb += int(disk[item]['size_gb'])
 
     facts = {}
+    facts['power_state'] = vm.summary.runtime.powerState
+    facts['vmmoid'] = vm._moId
     facts['vm_uuid'] = vm.config.uuid
     facts['vm_name'] = vm.config.name
+    facts['vm_folder'] = str(vm.parent.name)
+    facts['resource_pool'] = vm.resourcePool.name
     if guest_primary_ipaddress:
         facts['guest_primary_ipaddress'] = guest_primary_ipaddress
     facts['instance_uuid'] = vm.config.instanceUuid
@@ -763,42 +765,106 @@ def get_vnic_count(vm):
 
     return count
 
+def relocate_vm(
+        module, si, vm, resource_pool, cluster_name, vm_folder):
+        """
+        relocates a vm to the passed resource_pool, and cluster_name
+        """
+        content = si.RetrieveContent()
+        changes = []
+        changed = False
+
+        cluster = get_obj(content, [vim.ClusterComputeResource], cluster_name)
+        if not cluster:
+            module.fail_json(msg='can not locate cluster')
+
+        if resource_pool:
+            resource_pool = get_obj(content, [vim.ResourcePool], resource_pool, container=cluster)
+        else:
+            resource_pool = cluster.resourcePool
+
+        if vm_folder:
+            if vm_folder != vm.parent.name:
+                dest_folder = get_obj(content, [vim.Folder], vm_folder)
+                if not dest_folder:
+                    module.fail_json(msg='% Folder does not exist' % vm_folder)
+                items_to_move = [vm]
+                dest_folder.MoveIntoFolder_Task(items_to_move)
+                changed = True
+                changes.append('VM %s moved into %s folder' % (vm.config.name, vm_folder))
+
+        relospec = vim.vm.RelocateSpec()
+        # relospec.datastore = datastore
+        relospec.pool = resource_pool
+
+        if vm.resourcePool != resource_pool:
+            task = vm.RelocateVM_Task(relospec)
+            relocated_vm = wait_for_task(module, task)
+            changed = True
+            changes.append('VM relocated to %s RP' % (resource_pool.name))
+        else:
+            changed = False
+
+        module.exit_json(changed=changed, changes=changes)
+
+
+def get_datastores_in_cluster(si, datastore_cluster):
+        """
+        returns a list of datastores in datastore cluster
+        """
+        datastores = []
+        content = si.RetrieveContent()
+        datastore_cluster_obj = get_obj(content, [vim.StoragePod], datastore_cluster)
+        if datastore_cluster_obj:
+            for datastore in datastore_cluster_obj.childEntity:
+                datastores.append(datastore)
+
+        return datastores
+
 
 def clone_vm(
         module, si, vm_name, template, dns_list,
         suffix_list, datacenter_name, cluster_name,
-        datastores, domain_name, num_cpus, memory_mb,
-        vm_disk, vm_folder, vnics, resource_pool, vm_uuid,
-        resource_pools, os_family, login_password, full_name, org_name, disable_drs):
+        datastore, domain_name, num_cpus, memory_mb,
+        vm_disk, vm_folder, vnics, vm_uuid,
+        os_family, login_password, full_name, org_name, **kwargs):
     """
     Clones a VM from another VM or template
     does guest customizations on said VM
     reconfigures VMs disk config
     """
-    changed = True
+    resource_pool = kwargs.get('resource_pool', None)
+    changed = False
     changes = []
     content = si.RetrieveContent()
-    datastore_name = random.choice(datastores)
-    datastore = get_obj(content, [vim.Datastore], datastore_name)
     datacenter = get_obj(content, [vim.Datacenter], datacenter_name)
     cluster = get_obj(content, [vim.ClusterComputeResource], cluster_name)
-    # if passed a list of resource_pools choose one at random
-    if resource_pools:
-        resource_pool = random.choice(resource_pools)
+
+    datastores_in_cluster = get_datastores_in_cluster(si, datastore)
+    if datastores_in_cluster:
+        datastore_obj = random.choice(datastores_in_cluster)
+    else:
+        datastore_obj = get_obj(content, [vim.Datastore], datastore, container=datacenter)
 
     if vm_folder:
-        destfolder = get_obj(content, [vim.Folder], vm_folder)
+        destfolder = get_obj(content, [vim.Folder], vm_folder, container=datacenter)
     else:
         destfolder = datacenter.vmFolder
 
     if resource_pool:
-        resource_pool = get_obj(content, [vim.ResourcePool], resource_pool)
+        resource_pool = get_obj(content, [vim.ResourcePool], resource_pool, container=cluster)
     else:
         resource_pool = cluster.resourcePool
 
+    if not datastore_obj:
+        module.fail_json(msg='Datastore %s not found' % datastore)
+
+    if not destfolder:
+        module.fail_json(msg='Could not target a folder')
+
     # relocation spec
     relospec = vim.vm.RelocateSpec()
-    relospec.datastore = datastore
+    relospec.datastore = datastore_obj
     relospec.pool = resource_pool
 
     devices = []
@@ -958,8 +1024,6 @@ def clone_vm(
 
     task = template.Clone(folder=destfolder, name=vm_name, spec=clonespec)
     new_vm = wait_for_task(module, task)
-    if disable_drs:
-        disable_vm_drs(module, cluster, new_vm)
 
     changed = True
     changes.append('vm %s has been created' % vm_name)
@@ -970,68 +1034,11 @@ def clone_vm(
             for change in disk_changes:
                 changes.append(change)
 
-    if changed:
+    if changes:
         module.exit_json(
             changed=True, changes=changes,
             ansible_facts=gather_facts(new_vm))
 
-
-def enable_vm_drs(module, vm, cluster_name, content):
-    """
-    Re-enables DRS for a VM that was previously diabled
-    """
-    changed = False
-    changes = []
-    cluster = get_obj(content, [vim.ClusterComputeResource], cluster_name)
-
-    config_ex = vim.ClusterConfigSpecEx()
-    config_ex_drs_vm_config_spec = []
-    drs_vm_config_spec = vim.ClusterDrsVmConfigSpec()
-    drs_vm_config_spec.operation = 'remove'
-    drs_vm_config_spec.info = vim.ClusterDrsVmConfigInfo()
-    drs_vm_config_spec.removeKey = vm
-    drs_vm_config_spec.info.key = vm
-    drs_vm_config_spec.info.enabled = False
-
-    config_ex_drs_vm_config_spec.append(drs_vm_config_spec)
-    config_ex.drsVmConfigSpec = config_ex_drs_vm_config_spec
-
-    task = cluster.ReconfigureComputeResource_Task(config_ex, True)
-
-    task_done = False
-    while not task_done:
-        if task.info.state == 'error':
-            changed = False
-            task_done = True
-        elif task.info.state == 'success':
-            changed = True
-            changes.append('DRS re-enabled for %s' % vm.config.name)
-            task_done = True
-
-    if changed:
-        module.exit_json(changed=True, changes=changes)
-    else:
-        module.exit_json(changed=False)
-
-
-def disable_vm_drs(module, cluster, vm):
-    """
-    Disable DRS for a VM. for use with clone_vm
-    """
-
-    config_ex = vim.ClusterConfigSpecEx()
-    config_ex_drs_vm_config_spec = []
-    drs_vm_config_spec = vim.ClusterDrsVmConfigSpec()
-    drs_vm_config_spec.operation = 'add'
-    drs_vm_config_spec.info = vim.ClusterDrsVmConfigInfo()
-    drs_vm_config_spec.info.key = vm
-    drs_vm_config_spec.info.enabled = False
-
-    config_ex_drs_vm_config_spec.append(drs_vm_config_spec)
-    config_ex.drsVmConfigSpec = config_ex_drs_vm_config_spec
-
-    task = cluster.ReconfigureComputeResource_Task(config_ex, True)
-    wait_for_task(module, task)
 
 
 def upgrade_tools(module, vm):
@@ -1183,8 +1190,11 @@ def wait_for_task(module, task):
         if task.info.state == 'error':
             if isinstance(task.info.error, vim.fault.DuplicateName):
                 error_msg = "an object with the name %s already exists" % task.info.error.name
+            elif isinstance(task.info.error, vim.fault.FileFault):
+                error_msg = "file caused clone error. is CBT enabled?"
             module.fail_json(
                 msg=error_msg)
+
 
 
 def delete_vm(module, vm, vm_name):
