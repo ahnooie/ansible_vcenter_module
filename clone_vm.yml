@@ -36,9 +36,9 @@
           disk2:
             size_gb: 10
             type: thin
-        datastores: "{{datastores}}"
+        datastore: "{{datastore}}"
         num_cpus: 1
         memory_mb: 2048
         domain_name: example.com
-        resource_pools: "{{resource_pools}}"
+        resource_pool: "{{resource_pool}}"
         os_family: linux

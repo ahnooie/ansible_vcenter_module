@@ -3,12 +3,8 @@ vcenter_username: username
 vcenter_password: password
 
 # datastores and resource pools will be randomly selected
-datastores:
-    - 'DataStore_1'
-    - 'DataStore_2'
-resource_pools:
-    - 'RP_1'
-    - 'RP_2''
+datastores: 'DataStore_1'
+resource_pool: 'RP_1'
 
 datacenter: 'Datacenter1'
 cluster: 'Cluster1'
